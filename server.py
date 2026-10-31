@@ -40,7 +40,7 @@ TERMINAL = {COMPLETED, CANCELED, FAILED, REJECTED}
 
 MAX_BODY = 16 * 1024 * 1024
 MAX_RESPONSE = 500 * 1024  # contract limit is 512 KiB
-REQUEST_BUDGET = 38.0  # seconds of the 45s per-request limit we allow ourselves
+REQUEST_BUDGET = float(os.environ.get("REQUEST_BUDGET", "26"))  # seconds of the 45s per-request limit we allow ourselves
 
 
 def now_iso():
