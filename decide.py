@@ -21,7 +21,7 @@ log = logging.getLogger("decide")
 ACTIONS = ("settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception")
 
 # Bump to invalidate cached decisions when the prompt/validation logic changes.
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 
 # Keys that name a *namespace* rather than commercial content. They are removed
 # before hashing so Check/Save re-runs of the same package hit the cache.
@@ -171,6 +171,18 @@ class LLMError(Exception):
     pass
 
 
+MAX_ATTEMPTS = 6
+
+
+def backoff(err, attempt, deadline):
+    """Seconds to wait before retrying a 429/5xx: Retry-After if given, else 3,6,9,... capped."""
+    try:
+        wait = float(err.headers.get("Retry-After", ""))
+    except (TypeError, ValueError, AttributeError):
+        wait = 3.0 * (attempt + 1)
+    return max(0.5, min(wait, 20.0, deadline - time.monotonic() - 4))
+
+
 class OpenAICompatLLM:
     """Any OpenAI-style /chat/completions endpoint (OpenAI, Gemini's compat
     endpoint, Groq, OpenRouter, Together, Ollama, vLLM, ...)."""
@@ -181,7 +193,7 @@ class OpenAICompatLLM:
         self.extra, self.token_param, self.json_mode = extra or {}, token_param, json_mode
 
     def complete(self, system, user, deadline):
-        for attempt in range(3):
+        for attempt in range(MAX_ATTEMPTS):
             remaining = deadline - time.monotonic()
             if remaining < 3:
                 raise LLMError("no time left for model call")
@@ -211,12 +223,14 @@ class OpenAICompatLLM:
                     log.warning("provider rejected response_format; retrying without JSON mode")
                     self.json_mode = False
                     continue
-                if e.code in (429, 500, 502, 503, 504) and attempt < 2:
-                    time.sleep(min(2 ** attempt + 0.5, max(0, deadline - time.monotonic() - 4)))
+                if e.code in (429, 500, 502, 503, 504) and attempt < MAX_ATTEMPTS - 1:
+                    wait = backoff(e, attempt, deadline)
+                    log.warning("model HTTP %s, retrying in %.1fs (attempt %d)", e.code, wait, attempt + 1)
+                    time.sleep(wait)
                     continue
                 raise LLMError(f"model HTTP {e.code}: {detail}")
             except (urllib.error.URLError, TimeoutError, OSError) as e:
-                if attempt < 2 and deadline - time.monotonic() > 8:
+                if attempt < MAX_ATTEMPTS - 1 and deadline - time.monotonic() > 8:
                     continue
                 raise LLMError(f"model request failed: {e}")
         raise LLMError("model call failed")
@@ -228,7 +242,7 @@ class AnthropicLLM:
         self.key, self.model, self.max_tokens = api_key, model, max_tokens
 
     def complete(self, system, user, deadline):
-        for attempt in range(3):
+        for attempt in range(MAX_ATTEMPTS):
             remaining = deadline - time.monotonic()
             if remaining < 3:
                 raise LLMError("no time left for model call")
@@ -251,12 +265,12 @@ class AnthropicLLM:
                 return "".join(b.get("text", "") for b in data.get("content", []))
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:300]
-                if e.code in (429, 500, 502, 503, 529) and attempt < 2:
-                    time.sleep(min(2 ** attempt + 0.5, max(0, deadline - time.monotonic() - 4)))
+                if e.code in (429, 500, 502, 503, 529) and attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(backoff(e, attempt, deadline))
                     continue
                 raise LLMError(f"model HTTP {e.code}: {detail}")
             except (urllib.error.URLError, TimeoutError, OSError) as e:
-                if attempt < 2 and deadline - time.monotonic() > 8:
+                if attempt < MAX_ATTEMPTS - 1 and deadline - time.monotonic() > 8:
                     continue
                 raise LLMError(f"model request failed: {e}")
         raise LLMError("model call failed")
@@ -330,6 +344,7 @@ class Decider:
         self.pool = ThreadPoolExecutor(max_workers=int(parallel or os.environ.get("LLM_PARALLEL", "8")))
         self.inflight = {}  # cache key -> Future (shared by concurrent requests)
         self.ilock = threading.Lock()
+        self.samples_left = int(os.environ.get("LOG_SAMPLES", "3"))
 
     # public ------------------------------------------------------------
     def decide(self, batch, deadline):
@@ -403,7 +418,21 @@ class Decider:
                 if d is not None and d.get("strong"):
                     self.store.cache_put(k, d)
                 results[k] = d
-            log.info("model chunk of %d done in %.1fs", len(items), time.monotonic() - t0)
+            n_strong = sum(1 for d in got if d is not None and d.get("strong"))
+            n_none = sum(1 for d in got if d is None)
+            acts = {}
+            for d in got:
+                if d is not None:
+                    acts[d["action"]] = acts.get(d["action"], 0) + 1
+            log.info("model chunk of %d done in %.1fs: strong=%d weak=%d none=%d actions=%s",
+                     len(items), time.monotonic() - t0, n_strong, len(got) - n_strong - n_none, n_none, acts)
+            with self.ilock:
+                show = self.samples_left > 0
+                if show:
+                    self.samples_left -= 1
+            if show and got and got[0] is not None:
+                log.info("SAMPLE package=%s", json.dumps(items[0][1], ensure_ascii=False)[:7000])
+                log.info("SAMPLE decision=%s", json.dumps(got[0], ensure_ascii=False)[:1500])
         except Exception as e:  # noqa: BLE001
             log.error("model job failed: %s", e)
         finally:
@@ -521,7 +550,7 @@ class Decider:
             try:
                 parsed = parse_json_loose(text)
             except ValueError as e:
-                log.error("%s", e)
+                log.error("%s; raw model output starts: %r", e, (text or "")[:1200])
                 continue
             items = parsed.get("decisions") if isinstance(parsed, dict) else parsed
             if not isinstance(items, list):
@@ -534,6 +563,8 @@ class Decider:
                 if raw is None and len(items) == len(pending) and isinstance(items[pos], dict):
                     raw = items[pos]
                 d, problems = self._validate(pkgs[i], raw)
+                if problems:
+                    log.warning("validation problems for %s: %s", pid, "; ".join(problems)[:400])
                 if d is not None and (result[i] is None or d["strong"]):
                     result[i] = d
                 if d is None or not d["strong"]:
