@@ -13,6 +13,8 @@ import time
 import urllib.error
 import urllib.request
 import hashlib
+import concurrent.futures
+from concurrent.futures import Future, ThreadPoolExecutor
 
 log = logging.getLogger("decide")
 
@@ -43,11 +45,11 @@ HOW TO DECIDE
 3. Find the ONE paragraph that states the current, controlling finding for THIS invoice (the live reconciliation / payment-history / authority / verification determination). Base the action on that paragraph, read in the context of the current policy limits it relies on.
 4. Evidence: return EXACTLY THREE references, the three bracketed references that appear in that deciding paragraph, copied character-for-character from the documents including the square brackets. Never use the cover-sheet reference, archive/example references or training decoys.
 5. facts: vendorName and invoiceNumber exactly as printed on the invoice being decided; amountMinor is an INTEGER in minor currency units (for two-decimal currencies multiply the printed amount by 100, e.g. 1,234.50 INR -> 123450; zero-decimal currencies such as JPY are used as-is); currency is the 3-letter ISO code.
-6. rationale: 80-400 characters, plain sentences. State the action name and quote at least two of the three evidence references. Do not mention any other bracketed reference.
+6. rationale: ONE short sentence (at most 160 characters). State the action name and quote at least two of the three evidence references. Do not mention any other bracketed reference.
 
 OUTPUT: respond with ONE JSON object and nothing else:
 {"decisions":[{"packageId":"...","action":"<one of the five>","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":12345,"currency":"INR"},"evidenceRefs":["[..]","[..]","[..]"],"rationale":"..."}]}
-Include exactly one decision per package, in the same order, using the packageId given."""
+Include exactly one decision per package, in the same order, using the packageId given. Be compact: no text outside the JSON."""
 
 
 # ----------------------------------------------------------------------------
@@ -321,55 +323,92 @@ def llm_from_env(env=os.environ):
 # Decider
 # ----------------------------------------------------------------------------
 class Decider:
-    def __init__(self, store, llm, ref_style="verbatim", salt=""):
+    def __init__(self, store, llm, ref_style="verbatim", salt="", chunk=None, parallel=None, bg_budget=None):
         self.store, self.llm, self.ref_style, self.salt = store, llm, ref_style, salt
+        self.chunk = int(chunk or os.environ.get("LLM_CHUNK", "4"))
+        self.bg_budget = float(bg_budget or os.environ.get("LLM_BG_BUDGET", "120"))
+        self.pool = ThreadPoolExecutor(max_workers=int(parallel or os.environ.get("LLM_PARALLEL", "8")))
+        self.inflight = {}  # cache key -> Future (shared by concurrent requests)
+        self.ilock = threading.Lock()
 
     # public ------------------------------------------------------------
     def decide(self, batch, deadline):
-        """Return a list of decisions aligned with batch['packages']."""
+        """Return a list of decisions aligned with batch['packages'].
+
+        Model work runs in worker threads. We wait only until `deadline`; work that
+        is still running keeps going in the background and fills the cache, so the
+        next request for the same content is instant.
+        """
         packages = batch["packages"]
         policy = batch.get("policyRevision")
         keys = [cache_key(policy, p, self.salt) for p in packages]
-        by_key = {}  # key -> decision (canonical, bracketed refs)
-        todo = []  # (key, representative package)
+        resolved, waits, mine = {}, {}, []
         for k, p in zip(keys, packages):
-            if k in by_key or any(k == t[0] for t in todo):
+            if k in resolved or k in waits:
                 continue
-            hit = self.store.cache_get(k)
-            if hit:
-                by_key[k] = hit
-            else:
-                todo.append((k, p))
-        stats = {"cached": len(packages) - sum(1 for _ in todo), "model": len(todo)}
+            with self.ilock:
+                fut = self.inflight.get(k)
+                if fut is None:
+                    hit = self.store.cache_get(k)
+                    if hit:
+                        resolved[k] = hit
+                        continue
+                    fut = Future()
+                    self.inflight[k] = fut
+                    mine.append((k, p, fut))
+            waits[k] = fut
+        stats = {"packages": len(packages), "cached": len(resolved), "model": len(mine), "waiting_on_others": len(waits) - len(mine)}
 
-        fresh_ok = {}
-        if todo and self.llm is not None:
-            for i in range(0, len(todo), CHUNK):
-                chunk = todo[i : i + CHUNK]
-                try:
-                    got = self._ask(policy, [p for _, p in chunk], deadline)
-                except LLMError as e:
-                    log.error("model failure: %s", e)
-                    continue
-                for (k, p), d in zip(chunk, got):
-                    if d is not None:
-                        fresh_ok[k] = d
-        elif todo:
+        if mine and self.llm is not None:
+            bg_deadline = time.monotonic() + self.bg_budget
+            for i in range(0, len(mine), self.chunk):
+                self.pool.submit(self._job, policy, mine[i : i + self.chunk], bg_deadline)
+        elif mine:
             log.error("no LLM configured (set LLM_API_KEY and LLM_MODEL); using conservative fallback")
+            for k, p, fut in mine:
+                self._finish(k, fut, None)
+        if waits:
+            concurrent.futures.wait(list(waits.values()), timeout=max(0.0, deadline - time.monotonic()))
+        late = 0
+        for k, fut in waits.items():
+            if fut.done():
+                if fut.result() is not None:
+                    resolved[k] = fut.result()
+            else:
+                late += 1
+        stats["late"] = late
 
         out = []
         for k, p in zip(keys, packages):
-            d = by_key.get(k)
-            if d is None and k in fresh_ok:
-                d = fresh_ok[k]
-                if d.get("strong"):
-                    self.store.cache_put(k, d)
+            d = resolved.get(k)
             if d is None:
                 d = self._fallback(p)
                 log.warning("fallback decision used for package %s", p.get("packageId"))
             out.append(self._render(d))
         log.info("batch %s: %s", batch.get("batchId"), stats)
         return out
+
+    def _finish(self, key, fut, decision):
+        with self.ilock:
+            self.inflight.pop(key, None)
+        if not fut.done():
+            fut.set_result(decision)
+
+    def _job(self, policy, items, deadline):
+        results = {}
+        try:
+            t0 = time.monotonic()
+            got = self._ask(policy, [p for _, p, _ in items], deadline)
+            for (k, p, f), d in zip(items, got):
+                if d is not None and d.get("strong"):
+                    self.store.cache_put(k, d)
+                results[k] = d
+            log.info("model chunk of %d done in %.1fs", len(items), time.monotonic() - t0)
+        except Exception as e:  # noqa: BLE001
+            log.error("model job failed: %s", e)
+        finally:
+            for k, p, f in items:
+                self._finish(k, f, results.get(k))
 
     # internals -----------------------------------------------------------
     def _render(self, d):
